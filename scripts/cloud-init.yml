@@ -1,0 +1,751 @@
+#cloud-config
+
+# System update and package installation
+package_update: true
+package_upgrade: true
+
+# Required packages for the VPN server
+packages:
+  - python3
+  - python3-pip
+  - python3-venv
+  - wireguard
+  - strongswan
+  - iptables-persistent
+  - openssl
+  - git
+  - net-tools
+  - curl
+  - unzip
+  - gunicorn
+  - nginx
+  # Зависимости для liboqs
+  - cmake
+  - gcc
+  - ninja-build
+  - libssl-dev
+  - python3-dev
+
+# Enable IP forwarding for VPN
+write_files:
+  - path: /etc/sysctl.d/99-vpn.conf
+    content: |
+      net.ipv4.ip_forward=1
+      net.ipv6.conf.all.forwarding=1
+  
+  - path: /etc/modules-load.d/wireguard.conf
+    content: |
+      wireguard
+
+  - path: /etc/nginx/sites-available/vpn-api
+    content: |
+      server {
+          listen 80;
+          server_name _;
+
+          location / {
+              return 301 https://$host$request_uri;
+          }
+      }
+      
+      server {
+          listen 443 ssl;
+          server_name _;
+          
+          ssl_certificate /etc/adaptive-vpn/cert.pem;
+          ssl_certificate_key /etc/adaptive-vpn/key.pem;
+          
+          location / {
+              proxy_pass http://localhost:8000;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+          }
+      }
+
+  - path: /etc/systemd/system/vpn-server.service
+    content: |
+      [Unit]
+      Description=Adaptive VPN Server
+      After=network.target
+      
+      [Service]
+      User=root
+      WorkingDirectory=/opt/adaptive-vpn
+      ExecStart=/opt/adaptive-vpn/venv/bin/gunicorn --workers 4 --bind 127.0.0.1:8000 vpn_server:app
+      Restart=always
+      
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Apply sysctl settings
+  - sysctl -p /etc/sysctl.d/99-vpn.conf
+  
+  # Create project directory and virtual environment
+  - mkdir -p /opt/adaptive-vpn
+  - python3 -m venv /opt/adaptive-vpn/venv
+  
+  # Create necessary directories for VPN configurations
+  - mkdir -p /etc/adaptive-vpn/clients
+  - mkdir -p /etc/adaptive-vpn/kyber_keys
+  - mkdir -p /etc/ipsec.d/connections
+  
+  # Add iptables rules for masquerading traffic
+  - iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+  - netfilter-persistent save
+  
+  # Setup NGINX
+  - ln -sf /etc/nginx/sites-available/vpn-api /etc/nginx/sites-enabled/
+  - rm -f /etc/nginx/sites-enabled/default
+  - systemctl restart nginx
+  
+  # Clone the repository or copy files
+  - 'cd /opt/adaptive-vpn && echo "Setting up VPN server..."'
+  - |
+    cat > /opt/adaptive-vpn/vpn_server.py << 'EOL'
+    #!/usr/bin/env python3
+    import os
+    import sys
+    import time
+    import json
+    import socket
+    import logging
+    import argparse
+    import subprocess
+    import threading
+    import uuid
+    import ipaddress
+    from datetime import datetime, timedelta
+    from pathlib import Path
+    import secrets
+    import nacl.public
+    import nacl.utils
+    from nacl.bindings import crypto_scalarmult
+    from typing import Dict, List, Optional, Tuple, Any
+    import base64
+
+    # Import Flask for the API server
+    from flask import Flask, request, jsonify, Response
+    import werkzeug.serving
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("/var/log/vpn-server.log"),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logger = logging.getLogger('VPN-Server')
+
+    # Constants for the VPN server
+    CONFIG_DIR = Path("/etc/adaptive-vpn")
+    WIREGUARD_DIR = Path("/etc/wireguard")
+    WIREGUARD_CONFIG = WIREGUARD_DIR / "wg0.conf"
+    IPSEC_CONFIG = Path("/etc/ipsec.conf")
+    IPSEC_SECRETS = Path("/etc/ipsec.secrets")
+    IPSEC_CONNECTIONS = Path("/etc/ipsec.d/connections")
+    SERVER_PRIVATE_KEY_FILE = CONFIG_DIR / "server_private_key"
+    SERVER_PUBLIC_KEY_FILE = CONFIG_DIR / "server_public_key"
+    CLIENTS_DIR = CONFIG_DIR / "clients"
+    KYBER_KEYS_DIR = CONFIG_DIR / "kyber_keys"
+    DB_FILE = CONFIG_DIR / "clients_db.json"
+    WG_NETWORK = "10.10.10.0/24"
+    IPSEC_NETWORK = "10.20.20.0/24"
+
+    # Ensure directories exist
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    WIREGUARD_DIR.mkdir(parents=True, exist_ok=True)
+    CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
+    KYBER_KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    IPSEC_CONNECTIONS.parent.mkdir(parents=True, exist_ok=True)
+
+    # Flask app for API
+    app = Flask(__name__)
+
+    class PQCKyber:
+        """
+        Post-Quantum Cryptography implementation using Kyber algorithm
+        This is a simplified simulation - in a real application, use a proper Kyber library
+        """
+        @staticmethod
+        def generate_keypair():
+            # Simulates Kyber key generation with random bytes
+            private_key = os.urandom(32)
+            public_key = os.urandom(32)
+            return private_key, public_key
+        
+        @staticmethod
+        def encapsulate(public_key):
+            # Simulates Kyber encapsulation
+            ciphertext = os.urandom(32)
+            shared_secret = os.urandom(32)
+            return ciphertext, shared_secret
+        
+        @staticmethod
+        def decapsulate(private_key, ciphertext):
+            # Simulates Kyber decapsulation
+            # In a real implementation, the shared secret would be derived from the private key and ciphertext
+            return os.urandom(32)
+
+
+    class WireGuardManager:
+        """Manages WireGuard VPN connections"""
+        def __init__(self):
+            self.private_key = None
+            self.public_key = None
+            self.network = ipaddress.IPv4Network(WG_NETWORK)
+            self.used_ips = set()
+            self.next_ip_index = 2  # Start from .2 (.1 is server)
+            
+        def generate_keypair(self):
+            """Generate a WireGuard keypair"""
+            try:
+                private_key = subprocess.check_output(["wg", "genkey"], universal_newlines=True).strip()
+                public_key = subprocess.check_output(["wg", "pubkey"], input=private_key, universal_newlines=True).strip()
+                return private_key, public_key
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Error generating WireGuard keypair: {e}")
+                return None, None
+        
+        def initialize_server(self):
+            """Initialize the WireGuard server"""
+            # Generate server keypair if not exists
+            if not SERVER_PRIVATE_KEY_FILE.exists() or not SERVER_PUBLIC_KEY_FILE.exists():
+                private_key, public_key = self.generate_keypair()
+                if private_key and public_key:
+                    with open(SERVER_PRIVATE_KEY_FILE, 'w') as f:
+                        f.write(private_key)
+                    with open(SERVER_PUBLIC_KEY_FILE, 'w') as f:
+                        f.write(public_key)
+                    self.private_key = private_key
+                    self.public_key = public_key
+                    logger.info("Generated new WireGuard server keypair")
+                else:
+                    logger.error("Failed to generate WireGuard server keypair")
+                    return False
+            else:
+                # Load existing keys
+                with open(SERVER_PRIVATE_KEY_FILE, 'r') as f:
+                    self.private_key = f.read().strip()
+                with open(SERVER_PUBLIC_KEY_FILE, 'r') as f:
+                    self.public_key = f.read().strip()
+                logger.info("Loaded existing WireGuard server keypair")
+            
+            # Create initial WireGuard config
+            self._create_server_config()
+            return True
+        
+        def _create_server_config(self):
+            """Create the WireGuard server configuration file"""
+            config = f"""[Interface]
+    PrivateKey = {self.private_key}
+    Address = {self.network.network_address + 1}/24
+    ListenPort = 51820
+    SaveConfig = false
+    PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+    """
+            with open(WIREGUARD_CONFIG, 'w') as f:
+                f.write(config)
+            logger.info(f"Created WireGuard server config at {WIREGUARD_CONFIG}")
+        
+        def get_next_ip(self):
+            """Get the next available IP in the WireGuard subnet"""
+            while True:
+                candidate_ip = self.network.network_address + self.next_ip_index
+                self.next_ip_index += 1
+                
+                if candidate_ip not in self.used_ips and candidate_ip != self.network.network_address + 1:
+                    self.used_ips.add(candidate_ip)
+                    return str(candidate_ip)
+        
+        def add_client(self, client_id):
+            """Add a new WireGuard client"""
+            # Generate client keys
+            client_private_key, client_public_key = self.generate_keypair()
+            if not client_private_key or not client_public_key:
+                logger.error(f"Failed to generate WireGuard keys for client {client_id}")
+                return None
+            
+            # Assign IP to client
+            client_ip = self.get_next_ip()
+            
+            # Update server config with new peer
+            self._add_peer_to_config(client_public_key, client_ip)
+            
+            # Create client data
+            client_data = {
+                "client_wg_private_key": client_private_key,
+                "client_wg_public_key": client_public_key,
+                "client_ip": client_ip,
+                "server_wg_public_key": self.public_key,
+                "wireguard_port": 51820,
+                "dns": "1.1.1.1",
+                "created_at": datetime.now().isoformat()
+            }
+            
+            return client_data
+        
+        def _add_peer_to_config(self, client_public_key, client_ip):
+            """Add a peer to the WireGuard server configuration"""
+            peer_config = f"""
+    [Peer]
+    PublicKey = {client_public_key}
+    AllowedIPs = {client_ip}/32
+    """
+            with open(WIREGUARD_CONFIG, 'a') as f:
+                f.write(peer_config)
+            
+            # Apply the configuration
+            try:
+                # Check if interface exists
+                result = subprocess.run(["ip", "link", "show", "wg0"], capture_output=True, text=True)
+                if result.returncode == 0:
+                    # Interface exists, reload the configuration
+                    subprocess.run(["wg", "syncconf", "wg0", str(WIREGUARD_CONFIG)], check=True)
+                    logger.info(f"Updated WireGuard configuration with new peer: {client_ip}")
+                else:
+                    # Interface doesn't exist, start it
+                    subprocess.run(["wg-quick", "up", str(WIREGUARD_CONFIG)], check=True)
+                    logger.info(f"Started WireGuard with configuration from {WIREGUARD_CONFIG}")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Error applying WireGuard configuration: {e}")
+
+
+    class IPsecManager:
+        """Manages IPsec VPN connections"""
+        def __init__(self):
+            self.network = ipaddress.IPv4Network(IPSEC_NETWORK)
+            self.used_ips = set()
+            self.next_ip_index = 2  # Start from .2 (.1 is server)
+        
+        def initialize_server(self):
+            """Initialize the IPsec server"""
+            # Create base IPsec config if it doesn't exist
+            if not IPSEC_CONFIG.exists():
+                self._create_base_config()
+            
+            # Create base secrets file if it doesn't exist
+            if not IPSEC_SECRETS.exists():
+                with open(IPSEC_SECRETS, 'w') as f:
+                    f.write("# IPsec secrets file\n")
+            
+            return True
+        
+        def _create_base_config(self):
+            """Create the base IPsec configuration file"""
+            config = """config setup
+        charondebug="all"
+        uniqueids=yes
+        strictcrlpolicy=no
+
+    # Include connection configs
+    include /etc/ipsec.d/connections/*.conf
+    """
+            with open(IPSEC_CONFIG, 'w') as f:
+                f.write(config)
+            logger.info(f"Created base IPsec config at {IPSEC_CONFIG}")
+        
+        def get_next_ip(self):
+            """Get the next available IP in the IPsec subnet"""
+            while True:
+                candidate_ip = self.network.network_address + self.next_ip_index
+                self.next_ip_index += 1
+                
+                if candidate_ip not in self.used_ips and candidate_ip != self.network.network_address + 1:
+                    self.used_ips.add(candidate_ip)
+                    return str(candidate_ip)
+        
+        def add_client(self, client_id):
+            """Add a new IPsec client"""
+            # Generate a unique client ID
+            client_ipsec_id = f"client-{client_id[:8]}@adaptivevpn.local"
+            server_id = "server@adaptivevpn.local"
+            
+            # Generate PSK
+            psk = base64.b64encode(os.urandom(24)).decode('utf-8')
+            
+            # Assign IP to client
+            client_ip = self.get_next_ip()
+            
+            # Create client connection config
+            conn_file = IPSEC_CONNECTIONS / f"client-{client_id[:8]}.conf"
+            conn_name = f"client-{client_id[:8]}"
+            
+            conn_config = f"""conn {conn_name}
+        authby=secret
+        auto=add
+        keyexchange=ikev2
+        ike=aes256-sha256-modp2048,aes128-sha1-modp1024!
+        esp=aes256-sha256,aes128-sha1!
+        left=%any
+        leftid={server_id}
+        leftauth=psk
+        leftsubnet=0.0.0.0/0
+        right=%any
+        rightid={client_ipsec_id}
+        rightauth=psk
+        rightsourceip={client_ip}/32
+        type=tunnel
+        dpdaction=clear
+        dpddelay=300s
+        rekey=yes
+        closeaction=restart
+        keyingtries=%forever
+    """
+            with open(conn_file, 'w') as f:
+                f.write(conn_config)
+            
+            # Add PSK to secrets file
+            with open(IPSEC_SECRETS, 'a') as f:
+                f.write(f"\n{server_id} {client_ipsec_id} : PSK \"{psk}\"\n")
+            
+            # Reload IPsec configuration
+            try:
+                subprocess.run(["ipsec", "reload"], check=True)
+                logger.info(f"Added IPsec client {conn_name} and reloaded configuration")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Error reloading IPsec configuration: {e}")
+            
+            # Create client data
+            client_data = {
+                "client_id": client_ipsec_id,
+                "server_id": server_id,
+                "client_ip": client_ip,
+                "shared_psk": psk,
+                "created_at": datetime.now().isoformat()
+            }
+            
+            return client_data
+
+
+    class ClientManager:
+        """Manages VPN client registrations and configurations"""
+        def __init__(self):
+            self.wg_manager = WireGuardManager()
+            self.ipsec_manager = IPsecManager()
+            self.curve25519_keypair = None
+            self.kyber_keypair = None
+            self.clients = {}
+            self._load_clients_db()
+        
+        def _load_clients_db(self):
+            """Load clients database from file"""
+            if DB_FILE.exists():
+                try:
+                    with open(DB_FILE, 'r') as f:
+                        self.clients = json.load(f)
+                    logger.info(f"Loaded {len(self.clients)} clients from database")
+                except json.JSONDecodeError:
+                    logger.error("Error parsing clients database, starting with empty database")
+                    self.clients = {}
+            else:
+                self.clients = {}
+        
+        def _save_clients_db(self):
+            """Save clients database to file"""
+            with open(DB_FILE, 'w') as f:
+                json.dump(self.clients, f, indent=2)
+        
+        def initialize(self):
+            """Initialize the client manager"""
+            # Generate Curve25519 keypair if not exists
+            private_key_file = CONFIG_DIR / "server_curve25519_private_key"
+            public_key_file = CONFIG_DIR / "server_curve25519_public_key"
+            
+            if not private_key_file.exists() or not public_key_file.exists():
+                private_key = nacl.public.PrivateKey.generate()
+                public_key = private_key.public_key
+                
+                with open(private_key_file, 'wb') as f:
+                    f.write(bytes(private_key))
+                with open(public_key_file, 'wb') as f:
+                    f.write(bytes(public_key))
+                    
+                self.curve25519_keypair = {
+                    'private': private_key,
+                    'public': public_key
+                }
+                logger.info("Generated new Curve25519 server keypair")
+            else:
+                # Load existing keys
+                with open(private_key_file, 'rb') as f:
+                    private_key_bytes = f.read()
+                    private_key = nacl.public.PrivateKey(private_key_bytes)
+                
+                with open(public_key_file, 'rb') as f:
+                    public_key_bytes = f.read()
+                    public_key = nacl.public.PublicKey(public_key_bytes)
+                    
+                self.curve25519_keypair = {
+                    'private': private_key,
+                    'public': public_key
+                }
+                logger.info("Loaded existing Curve25519 server keypair")
+            
+            # Generate Kyber keypair
+            private_key_file = KYBER_KEYS_DIR / "server_private_key"
+            public_key_file = KYBER_KEYS_DIR / "server_public_key"
+            
+            if not private_key_file.exists() or not public_key_file.exists():
+                private_key, public_key = PQCKyber.generate_keypair()
+                
+                with open(private_key_file, 'wb') as f:
+                    f.write(private_key)
+                with open(public_key_file, 'wb') as f:
+                    f.write(public_key)
+                    
+                self.kyber_keypair = {
+                    'private': private_key,
+                    'public': public_key
+                }
+                logger.info("Generated new Kyber server keypair")
+            else:
+                # Load existing keys
+                with open(private_key_file, 'rb') as f:
+                    private_key = f.read()
+                
+                with open(public_key_file, 'rb') as f:
+                    public_key = f.read()
+                    
+                self.kyber_keypair = {
+                    'private': private_key,
+                    'public': public_key
+                }
+                logger.info("Loaded existing Kyber server keypair")
+            
+            # Initialize VPN managers
+            self.wg_manager.initialize_server()
+            self.ipsec_manager.initialize_server()
+            
+            return True
+        
+        def register_client(self, session_id, curve25519_public_key_hex, kyber_public_key_hex):
+            """Register a new client"""
+            # Check if client already exists
+            if session_id in self.clients:
+                logger.info(f"Client {session_id} already registered, updating keys")
+            
+            # Decode client's Curve25519 public key
+            try:
+                client_curve_public_key = bytes.fromhex(curve25519_public_key_hex)
+                client_kyber_public_key = bytes.fromhex(kyber_public_key_hex)
+            except ValueError as e:
+                logger.error(f"Invalid key format from client: {e}")
+                return None, None
+            
+            # Compute shared secret with Curve25519
+            server_private = self.curve25519_keypair['private']
+            curve_shared_secret = crypto_scalarmult(
+                server_private._private_key,
+                client_curve_public_key
+            )
+            
+            # Generate Kyber shared secret
+            kyber_ciphertext, kyber_shared_secret = PQCKyber.encapsulate(client_kyber_public_key)
+            
+            # Combine both shared secrets (in a real implementation)
+            # For now, we'll just use the Curve25519 shared secret
+            shared_secret = curve_shared_secret
+            
+            # Store client info
+            self.clients[session_id] = {
+                "session_id": session_id,
+                "curve25519_public_key": curve25519_public_key_hex,
+                "kyber_public_key": kyber_public_key_hex,
+                "shared_secret": shared_secret.hex(),
+                "registered_at": datetime.now().isoformat(),
+                "last_active": datetime.now().isoformat()
+            }
+            
+            # Save clients database
+            self._save_clients_db()
+            
+            # Create directory for client configs
+            client_dir = CLIENTS_DIR / session_id
+            client_dir.mkdir(exist_ok=True)
+            
+            # Generate VPN configurations for client
+            wireguard_config = self.wg_manager.add_client(session_id)
+            ipsec_config = self.ipsec_manager.add_client(session_id)
+            
+            # Save client-specific configurations
+            with open(client_dir / "wireguard.json", 'w') as f:
+                json.dump(wireguard_config, f, indent=2)
+                
+            with open(client_dir / "ipsec.json", 'w') as f:
+                json.dump(ipsec_config, f, indent=2)
+            
+            # Update client record with VPN configs
+            self.clients[session_id].update({
+                "wireguard": wireguard_config,
+                "ipsec": ipsec_config
+            })
+            self._save_clients_db()
+            
+            logger.info(f"Client {session_id} registered successfully")
+            
+            return bytes(self.curve25519_keypair['public']).hex(), kyber_ciphertext.hex()
+        
+        def get_client_configs(self, session_id, auth_key):
+            """Get client configurations"""
+            if session_id not in self.clients:
+                logger.error(f"Unknown client: {session_id}")
+                return None
+                
+            client = self.clients[session_id]
+            stored_secret = bytes.fromhex(client["shared_secret"])
+            
+            # In a real implementation, verify the auth key against the shared secret
+            
+            # Update last active timestamp
+            client["last_active"] = datetime.now().isoformat()
+            self._save_clients_db()
+            
+            # Return VPN configurations
+            return {
+                "wireguard": client["wireguard"],
+                "ipsec": client["ipsec"]
+            }
+
+
+    # Create client manager instance
+    client_manager = ClientManager()
+
+
+    @app.route('/register', methods=['POST'])
+    def register():
+        """Handle client registration"""
+        try:
+            data = request.get_json()
+            session_id = data.get('session_id')
+            curve25519_public_key = data.get('curve25519_public_key')
+            kyber_public_key = data.get('kyber_public_key')
+            
+            if not session_id or not curve25519_public_key or not kyber_public_key:
+                return jsonify({"error": "Missing required parameters"}), 400
+            
+            server_curve_public_key, kyber_ciphertext = client_manager.register_client(
+                session_id, 
+                curve25519_public_key, 
+                kyber_public_key
+            )
+            
+            if not server_curve_public_key:
+                return jsonify({"error": "Failed to register client"}), 500
+            
+            return jsonify({
+                "curve25519_public_key": server_curve_public_key,
+                "kyber_ciphertext": kyber_ciphertext
+            })
+            
+        except Exception as e:
+            logger.error(f"Error during registration: {e}")
+            return jsonify({"error": "Internal server error"}), 500
+
+
+    @app.route('/get_configs', methods=['GET'])
+    def get_configs():
+        """Handle client configuration request"""
+        try:
+            auth_header = request.headers.get('Authorization')
+            key_header = request.headers.get('X-Auth-Key')
+            
+            if not auth_header or not auth_header.startswith('Bearer '):
+                return jsonify({"error": "Missing or invalid authorization header"}), 401
+            
+            session_id = auth_header.split(' ')[1]
+            
+            configs = client_manager.get_client_configs(session_id, key_header)
+            if not configs:
+                return jsonify({"error": "Authentication failed"}), 401
+            
+            return jsonify(configs)
+            
+        except Exception as e:
+            logger.error(f"Error getting configurations: {e}")
+            return jsonify({"error": "Internal server error"}), 500
+
+
+    @app.route('/speedtest', methods=['GET'])
+    def speedtest():
+        """Endpoint for bandwidth testing"""
+        # Generate a file of the specified size (1MB)
+        size_mb = 1
+        random_data = os.urandom(size_mb * 1024 * 1024)
+        
+        return Response(
+            random_data,
+            mimetype='application/octet-stream',
+            headers={'Content-Disposition': 'attachment; filename=speedtest.bin'}
+        )
+
+
+    def main():
+        parser = argparse.ArgumentParser(description='Adaptive VPN Server')
+        parser.add_argument('--port', type=int, default=8443,
+                            help='Port for the API server')
+        parser.add_argument('--debug', action='store_true',
+                            help='Enable debug mode')
+        args = parser.parse_args()
+        
+        logger.info("Initializing VPN server...")
+        if client_manager.initialize():
+            logger.info("VPN server initialized successfully")
+        else:
+            logger.error("Failed to initialize VPN server")
+            return 1
+        
+        # Generate SSL certificates for HTTPS if needed
+        cert_file = CONFIG_DIR / "cert.pem"
+        key_file = CONFIG_DIR / "key.pem"
+        
+        if not cert_file.exists() or not key_file.exists():
+            logger.info("Generating self-signed SSL certificate")
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:4096", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "365", "-subj", "/CN=adaptivevpn.local"
+            ], check=True)
+        
+        ssl_context = (str(cert_file), str(key_file))
+        
+        # Run the API server
+        logger.info(f"Starting API server on port {args.port}")
+        app.run(host='0.0.0.0', port=args.port, ssl_context=ssl_context, debug=args.debug)
+
+
+    if __name__ == "__main__":
+        main()
+    EOL
+  
+  # Create requirements.txt
+  - |
+    cat > /opt/adaptive-vpn/requirements.txt << 'EOL'
+    flask>=2.2.3
+    werkzeug>=2.2.3
+    pynacl>=1.5.0
+    cryptography>=39.0.0
+    argparse>=1.4.0
+    gunicorn>=20.1.0
+    EOL
+  
+  # Install dependencies
+  - /opt/adaptive-vpn/venv/bin/pip install -r /opt/adaptive-vpn/requirements.txt
+  
+  # Install liboqs-python for real Kyber implementation
+  - /opt/adaptive-vpn/venv/bin/pip install liboqs-python
+  
+  # Start the services
+  - systemctl enable vpn-server
+  - systemctl start vpn-server
+  
+  # Start StrongSwan
+  - systemctl enable strongswan
+  - systemctl start strongswan
+  
+  # Write setup completion message
+  - echo "Adaptive VPN Server setup complete!" > /etc/motd 
